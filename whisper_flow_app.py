@@ -20,7 +20,7 @@ from Cocoa import NSSound
 from Quartz import CGEventMaskBit, kCGEventKeyDown
 import Quartz
 import numpy as np
-import mlx.core as mx
+import tempfile
 import torch
 import time
 
@@ -42,11 +42,6 @@ MODELS = {
         "path": "mlx-community/parakeet-tdt-1.1b"
     }
 }
-
-# Audio feed interval: accumulate this many chunks before feeding to stream
-# 1024 frames at 16kHz = 64ms per chunk, 8 chunks = ~0.5s
-STREAM_FEED_INTERVAL = 8
-
 
 def log(message):
     """Write log message with timestamp"""
@@ -112,9 +107,6 @@ class VoiceTranscriber:
         self.input_device_name = self.config.get("device_name", None)
         self.vad_model = None
         self.vad_device = None
-
-        # Streaming transcription context
-        self.stream_ctx = None
 
         # Pre-initialize audio to reduce first-recording latency
         self._warmup_audio()
@@ -269,7 +261,7 @@ class VoiceTranscriber:
             self.vad_model = None
 
     def load_model(self):
-        """Load the Parakeet transcription model with streaming warmup"""
+        """Load the Parakeet transcription model with warmup for fast first inference"""
         if self.model_loaded:
             return
 
@@ -280,8 +272,7 @@ class VoiceTranscriber:
         try:
             self.model = from_pretrained(model_info['path'])
 
-            # Warmup: run a streaming inference to JIT-compile the path we use
-            log("Warming up model (streaming JIT compilation)...")
+            log("Warming up model (JIT compilation)...")
             self._warmup_model()
 
             self.model_loaded = True
@@ -307,15 +298,24 @@ class VoiceTranscriber:
         threading.Thread(target=self.load_vad_model, daemon=True).start()
 
     def _warmup_model(self):
-        """Warmup using streaming path to JIT-compile encoder + decoder"""
+        """Run a warmup transcription to trigger JIT compilation"""
         try:
+            self.model.encoder.set_attention_model("rel_pos_local_attn", (256, 256))
+            log("Set local attention mode (256, 256)")
+
             warmup_samples = np.zeros(8000, dtype=np.float32)
-            stream = self.model.transcribe_stream(context_size=(256, 256), depth=1)
-            stream.__enter__()
-            stream.add_audio(mx.array(warmup_samples))
-            _ = stream.result
-            stream.__exit__(None, None, None)
-            log("Streaming model warmup complete")
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                warmup_path = f.name
+                with wave.open(warmup_path, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(16000)
+                    wf.writeframes((warmup_samples * 32767).astype(np.int16).tobytes())
+
+            _ = self.model.transcribe(warmup_path)
+            Path(warmup_path).unlink(missing_ok=True)
+            log("Model warmup complete")
         except Exception as e:
             log(f"Warmup error (non-fatal): {e}")
 
@@ -333,7 +333,7 @@ class VoiceTranscriber:
         self.stream = self.audio.open(**stream_params)
 
     def start_recording(self):
-        """Start recording with streaming transcription"""
+        """Start recording audio for quick transcription to clipboard"""
         log("Start recording requested...")
         if not self.model_loaded:
             log("Model not loaded yet")
@@ -351,20 +351,6 @@ class VoiceTranscriber:
         self.is_recording = True
         self.frames = []
         self.app.title = "🔴"
-        self.record_start_time = time.time()
-
-        # Open streaming transcription context
-        try:
-            self.stream_ctx = self.model.transcribe_stream(
-                context_size=(256, 256), depth=1
-            )
-            self.stream_ctx.__enter__()
-            log("Streaming transcription context opened")
-        except Exception as e:
-            log(f"Error opening stream context: {e}")
-            import traceback
-            log(traceback.format_exc())
-            self.stream_ctx = None
 
         # Open audio stream with device fallback
         device_name = self.input_device_name or "Default"
@@ -389,7 +375,6 @@ class VoiceTranscriber:
                 log(traceback.format_exc())
                 self.is_recording = False
                 self.app.title = "❌"
-                self._cleanup_stream_ctx()
                 safe_notification(
                     title="Recording Error",
                     subtitle="Failed to start recording",
@@ -400,51 +385,19 @@ class VoiceTranscriber:
         play_sound("Tink")
 
         def record():
-            """Recording loop: capture audio and feed to streaming transcription"""
-            feed_counter = 0
-            audio_accumulator = []
-
             while self.is_recording:
                 try:
                     data = self.stream.read(CHUNK, exception_on_overflow=False)
                     self.frames.append(data)
-
-                    # Accumulate audio for streaming transcription
-                    if self.stream_ctx is not None:
-                        audio_accumulator.append(data)
-                        feed_counter += 1
-
-                        if feed_counter >= STREAM_FEED_INTERVAL:
-                            combined = b"".join(audio_accumulator)
-                            audio_float = np.frombuffer(
-                                combined, dtype=np.int16
-                            ).astype(np.float32) / 32768.0
-                            try:
-                                self.stream_ctx.add_audio(mx.array(audio_float))
-                            except Exception as e:
-                                log(f"Stream feed error: {e}")
-                            audio_accumulator = []
-                            feed_counter = 0
                 except Exception as e:
                     log(f"Recording error: {e}")
                     break
-
-            # Feed any remaining accumulated audio
-            if self.stream_ctx is not None and audio_accumulator:
-                combined = b"".join(audio_accumulator)
-                audio_float = np.frombuffer(
-                    combined, dtype=np.int16
-                ).astype(np.float32) / 32768.0
-                try:
-                    self.stream_ctx.add_audio(mx.array(audio_float))
-                except Exception as e:
-                    log(f"Stream final feed error: {e}")
 
         self.record_thread = threading.Thread(target=record, daemon=True)
         self.record_thread.start()
 
     def stop_recording(self):
-        """Stop recording and get streaming transcription result"""
+        """Stop recording and transcribe to clipboard"""
         log("Stop recording requested...")
         if not self.is_recording:
             log("Not currently recording")
@@ -470,10 +423,8 @@ class VoiceTranscriber:
         log(f"Processing {duration:.1f}s of audio...")
         play_sound("Tink")
 
-        # Check if we have audio data
         if not self.frames:
             log("No audio data recorded")
-            self._cleanup_stream_ctx()
             self.app.title = "🎙️"
             safe_notification(
                 title="No Audio", subtitle="No audio was recorded", message=""
@@ -493,53 +444,59 @@ class VoiceTranscriber:
                 wf.writeframes(b"".join(self.frames))
             log(f"Audio saved: {audio_path}")
         except Exception as e:
-            log(f"Error saving audio (non-fatal): {e}")
-
-        # Get streaming transcription result (already processed during recording)
-        transcribed_text = ""
-        if self.stream_ctx is not None:
-            try:
-                result = self.stream_ctx.result
-                transcribed_text = result.text.strip()
-            except Exception as e:
-                log(f"Stream result error: {e}")
-                import traceback
-                log(traceback.format_exc())
-
-        self._cleanup_stream_ctx()
-
-        elapsed = time.time() - self.record_start_time
-        log(f"Transcription result ({elapsed:.2f}s total): '{transcribed_text}'")
-
-        if transcribed_text:
-            pyperclip.copy(transcribed_text)
-            log("Copied to clipboard")
-            play_sound("Glass")
-            safe_notification(
-                title="Transcribed",
-                subtitle=transcribed_text[:50]
-                + ("..." if len(transcribed_text) > 50 else ""),
-                message="Copied to clipboard",
-            )
-        else:
-            log("No speech detected")
+            log(f"Error saving audio: {e}")
+            import traceback
+            log(traceback.format_exc())
+            self.app.title = "❌"
             play_sound("Funk")
-            safe_notification(
-                title="No Speech Detected",
-                subtitle="Try speaking louder",
-                message="",
+            return
+
+        # Transcribe in background
+        threading.Thread(
+            target=self._transcribe_and_copy, args=(audio_path,), daemon=True
+        ).start()
+
+    def _transcribe_and_copy(self, audio_path):
+        """Transcribe audio and copy to clipboard"""
+        try:
+            log("Starting transcription...")
+            start_time = time.time()
+
+            result = self.model.transcribe(
+                str(audio_path),
+                chunk_duration=30.0,
+                overlap_duration=2.0,
             )
+            transcribed_text = result.text.strip()
 
-        self.app.title = "🎙️"
+            elapsed = time.time() - start_time
+            log(f"Transcription ({elapsed:.2f}s): '{transcribed_text}'")
 
-    def _cleanup_stream_ctx(self):
-        """Clean up streaming transcription context"""
-        if self.stream_ctx is not None:
-            try:
-                self.stream_ctx.__exit__(None, None, None)
-            except Exception:
-                pass
-            self.stream_ctx = None
+            if transcribed_text:
+                pyperclip.copy(transcribed_text)
+                log("Copied to clipboard")
+                play_sound("Glass")
+                safe_notification(
+                    title="Transcribed",
+                    subtitle=transcribed_text[:50]
+                    + ("..." if len(transcribed_text) > 50 else ""),
+                    message="Copied to clipboard",
+                )
+            else:
+                log("No speech detected")
+                play_sound("Funk")
+                safe_notification(
+                    title="No Speech Detected",
+                    subtitle="Try speaking louder",
+                    message="",
+                )
+        except Exception as e:
+            log(f"Transcription error: {e}")
+            import traceback
+            log(traceback.format_exc())
+            play_sound("Funk")
+        finally:
+            self.app.title = "🎙️"
 
     def toggle_recording(self):
         """Toggle recording on/off"""
@@ -550,7 +507,6 @@ class VoiceTranscriber:
 
     def cleanup(self):
         """Clean up resources"""
-        self._cleanup_stream_ctx()
         if self.stream:
             self.stream.stop_stream()
             self.stream.close()
