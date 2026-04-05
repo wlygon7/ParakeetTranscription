@@ -5,12 +5,16 @@ description = "macOS menu bar app for real-time voice transcription — Parakeet
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "parakeet-mlx>=0.4.0",
-    "faster-whisper>=1.0.0",
+    # Apple Silicon only — MLX/Metal GPU-accelerated Parakeet
+    "parakeet-mlx>=0.4.0; platform_machine == 'arm64'",
+    # Intel Mac only — CTranslate2/int8 CPU-optimized Whisper
+    "faster-whisper>=1.0.0; platform_machine == 'x86_64'",
     "pyaudio>=0.2.14",
     "pyperclip>=1.11.0",
     "rumps>=0.4.0",
     "numpy>=1.26.0",
-    "torch>=2.0.0",
+    # PyTorch dropped Intel Mac support in 2.5.0; pin <2.5 for x86_64
+    "torch>=2.0.0,<2.5.0; platform_machine == 'x86_64'",
+    "torch>=2.0.0; platform_machine == 'arm64'",
     "onnxruntime>=1.23.2",
 ]
