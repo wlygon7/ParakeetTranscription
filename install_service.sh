@@ -60,12 +60,33 @@ fi
 # ------------------------------------------------------------------
 cd "$SCRIPT_DIR"
 
-if [ ! -d "$SCRIPT_DIR/.venv" ]; then
-    echo "Creating virtual environment..."
-    # Try 3.13 first, fall back to 3.12 if unavailable
-    uv venv --python 3.13 2>/dev/null || uv venv --python 3.12
+MACHINE_ARCH=$(uname -m)
+if [ "$MACHINE_ARCH" = "arm64" ]; then
+    # Apple Silicon: Python 3.13 — full MLX/Metal support
+    PYTHON_VERSION="3.13"
+    echo "Detected Apple Silicon (arm64) — using Python ${PYTHON_VERSION}"
 else
-    echo "[ok] Virtual environment exists"
+    # Intel Mac: Python 3.12 required — PyTorch dropped Intel Mac in 2.5.0,
+    # and the last compatible version (2.4.x) only has wheels for Python ≤3.12
+    PYTHON_VERSION="3.12"
+    echo "Detected Intel Mac (x86_64) — using Python ${PYTHON_VERSION}"
+fi
+
+# Check if existing venv uses the right Python version; recreate if not
+if [ -d "$SCRIPT_DIR/.venv" ]; then
+    VENV_PY_VER=$("$PYTHON_PATH" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "unknown")
+    REQUIRED_MAJOR_MINOR="${PYTHON_VERSION%.*}.${PYTHON_VERSION##*.}"
+    if [ "$VENV_PY_VER" != "$PYTHON_VERSION" ]; then
+        echo "Existing venv uses Python ${VENV_PY_VER}, need ${PYTHON_VERSION} — recreating..."
+        rm -rf "$SCRIPT_DIR/.venv"
+    else
+        echo "[ok] Virtual environment exists (Python ${VENV_PY_VER})"
+    fi
+fi
+
+if [ ! -d "$SCRIPT_DIR/.venv" ]; then
+    echo "Creating virtual environment (Python ${PYTHON_VERSION})..."
+    uv venv --python "$PYTHON_VERSION"
 fi
 
 echo "Installing Python dependencies..."
