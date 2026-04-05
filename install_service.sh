@@ -58,17 +58,19 @@ fi
 # ------------------------------------------------------------------
 # 4. Python virtual environment + dependencies
 # ------------------------------------------------------------------
+cd "$SCRIPT_DIR"
+
 if [ ! -d "$SCRIPT_DIR/.venv" ]; then
     echo "Creating virtual environment..."
-    cd "$SCRIPT_DIR"
-    uv venv --python 3.13
+    # Try 3.13 first, fall back to 3.12 if unavailable
+    uv venv --python 3.13 2>/dev/null || uv venv --python 3.12
 else
     echo "[ok] Virtual environment exists"
 fi
 
 echo "Installing Python dependencies..."
-cd "$SCRIPT_DIR"
-uv pip install -e .
+# Explicitly target the venv Python so uv pip doesn't fall back to a system interpreter
+uv pip install -e . --python "$PYTHON_PATH"
 
 echo "[ok] Dependencies installed"
 
