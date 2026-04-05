@@ -586,7 +586,10 @@ class VoiceTranscriptionApp(rumps.App):
         menu_items = [
             rumps.MenuItem("Status: Loading...", callback=None),
             rumps.separator,
-            rumps.MenuItem("Alt+R: Transcribe to clipboard", callback=None),
+            rumps.MenuItem(
+                ("Alt+R" if IS_APPLE_SILICON else "Ctrl+R") + ": Transcribe to clipboard",
+                callback=None
+            ),
             rumps.separator,
         ]
 
@@ -706,7 +709,15 @@ class VoiceTranscriptionApp(rumps.App):
         self.menu["Status: Loading..."].title = "Status: Ready"
 
     def start_keyboard_listener(self):
-        """Start listening for Alt+R hotkey"""
+        """Start listening for the transcription hotkey.
+
+        Apple Silicon: Alt+R (Option+R)
+        Intel Mac:     Ctrl+R — Option+R on Intel produces ® and conflicts
+        """
+        if IS_APPLE_SILICON:
+            HOTKEY_LABEL = "Alt+R"
+        else:
+            HOTKEY_LABEL = "Ctrl+R"
 
         def event_handler(proxy, event_type, event, refcon):
             try:
@@ -717,16 +728,24 @@ class VoiceTranscriptionApp(rumps.App):
 
                 # Check modifiers
                 alt_pressed = (flags & Quartz.kCGEventFlagMaskAlternate) != 0
+                ctrl_pressed = (flags & Quartz.kCGEventFlagMaskControl) != 0
                 shift_pressed = (flags & Quartz.kCGEventFlagMaskShift) != 0
                 cmd_pressed = (flags & Quartz.kCGEventFlagMaskCommand) != 0
 
-                # Key code 15 is 'r', only respond to Alt+R (no shift, no cmd)
+                # Key code 15 is 'r'
                 if event_type == kCGEventKeyDown and keycode == 15:
-                    if alt_pressed and not shift_pressed and not cmd_pressed:
+                    if IS_APPLE_SILICON:
+                        # Alt+R (no shift, no cmd)
+                        triggered = alt_pressed and not shift_pressed and not cmd_pressed
+                    else:
+                        # Ctrl+R (no alt, no shift, no cmd) — avoids ® conflict on Intel
+                        triggered = ctrl_pressed and not alt_pressed and not shift_pressed and not cmd_pressed
+
+                    if triggered:
                         current_time = time.time()
                         if current_time - self.last_hotkey_time > self.hotkey_debounce:
                             self.last_hotkey_time = current_time
-                            log("Alt+R pressed")
+                            log(f"{HOTKEY_LABEL} pressed")
                             threading.Thread(
                                 target=self.transcriber.toggle_recording,
                                 daemon=True,
@@ -765,7 +784,7 @@ class VoiceTranscriptionApp(rumps.App):
             )
 
             Quartz.CGEventTapEnable(self.event_tap, True)
-            log("Hotkey listener started (Alt+R)")
+            log(f"Hotkey listener started ({HOTKEY_LABEL})")
 
         except Exception as e:
             log(f"Failed to setup event tap: {e}")
