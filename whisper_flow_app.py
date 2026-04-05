@@ -3,8 +3,8 @@
 Voice Transcription Menu Bar App
 Alt+R: Quick transcription to clipboard
 
-Powered by NVIDIA Parakeet on Apple Silicon via MLX
-Optimized for low-latency real-time streaming transcription
+Apple Silicon: Powered by NVIDIA Parakeet via MLX (Metal GPU-accelerated)
+Intel Mac:     Powered by Whisper via faster-whisper (CTranslate2/int8 CPU-optimized)
 """
 
 import pyaudio
@@ -13,8 +13,8 @@ import pyperclip
 import threading
 import rumps
 import sys
+import platform
 from pathlib import Path
-from parakeet_mlx import from_pretrained
 from datetime import datetime
 from Cocoa import NSSound
 from Quartz import CGEventMaskBit, kCGEventKeyDown
@@ -24,6 +24,15 @@ import tempfile
 import torch
 import time
 
+# Detect CPU architecture: arm64 = Apple Silicon, x86_64 = Intel
+ARCH = platform.machine()
+IS_APPLE_SILICON = (ARCH == "arm64")
+
+if IS_APPLE_SILICON:
+    from parakeet_mlx import from_pretrained
+else:
+    from faster_whisper import WhisperModel
+
 # Setup logging to file
 import os
 import json
@@ -31,17 +40,31 @@ import json
 CONFIG_FILE = os.path.expanduser("~/.parakeet_config.json")
 LOG_FILE = os.path.expanduser("~/Library/Logs/VoiceTranscription_debug.log")
 
-# Model Constants
-MODELS = {
-    "fast": {
-        "name": "Fast (0.6b)",
-        "path": "mlx-community/parakeet-tdt-0.6b-v3"
-    },
-    "accurate": {
-        "name": "Accurate (1.1b)",
-        "path": "mlx-community/parakeet-tdt-1.1b"
+# Model Constants — architecture-specific
+if IS_APPLE_SILICON:
+    # MLX Metal GPU-accelerated Parakeet (Apple Silicon only)
+    MODELS = {
+        "fast": {
+            "name": "Fast (0.6b)",
+            "path": "mlx-community/parakeet-tdt-0.6b-v3",
+        },
+        "accurate": {
+            "name": "Accurate (1.1b)",
+            "path": "mlx-community/parakeet-tdt-1.1b",
+        },
     }
-}
+else:
+    # CTranslate2/int8 Whisper models — optimized for Intel CPU via AVX/AVX2
+    MODELS = {
+        "fast": {
+            "name": "Fast (Whisper Medium)",
+            "size": "medium",
+        },
+        "accurate": {
+            "name": "Accurate (Whisper Large-v3)",
+            "size": "large-v3",
+        },
+    }
 
 def log(message):
     """Write log message with timestamp"""
@@ -56,7 +79,7 @@ log("Starting Voice Transcription App")
 log(f"PATH: {os.environ.get('PATH', 'NOT SET')}")
 
 # Configuration
-RECORDING_ARCHIVE_PATH = Path("/Users/gassandrid/MEDIA/recordings")
+RECORDING_ARCHIVE_PATH = Path.home() / "MEDIA" / "recordings"
 QUICK_NOTES_PATH = RECORDING_ARCHIVE_PATH / "quick_notes"
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -261,23 +284,32 @@ class VoiceTranscriber:
             self.vad_model = None
 
     def load_model(self):
-        """Load the Parakeet transcription model with warmup for fast first inference"""
+        """Load the transcription model with warmup for fast first inference.
+
+        Apple Silicon: loads parakeet-mlx (MLX/Metal GPU-accelerated)
+        Intel Mac:     loads faster-whisper (CTranslate2/int8 CPU-optimized)
+        """
         if self.model_loaded:
             return
 
         self.app.title = "⏳"
         model_info = MODELS.get(self.current_model_key, MODELS["fast"])
-        log(f"Loading Parakeet model: {model_info['name']} ({model_info['path']})...")
 
         try:
-            self.model = from_pretrained(model_info['path'])
-
-            log("Warming up model (JIT compilation)...")
-            self._warmup_model()
+            if IS_APPLE_SILICON:
+                log(f"Loading Parakeet model: {model_info['name']} ({model_info['path']})...")
+                self.model = from_pretrained(model_info['path'])
+                log("Warming up model (JIT compilation)...")
+                self._warmup_model()
+            else:
+                model_size = model_info['size']
+                log(f"Loading Whisper {model_info['name']} on Intel CPU (CTranslate2/int8)...")
+                self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
+                log(f"Whisper {model_info['name']} loaded (Intel CPU optimized)")
 
             self.model_loaded = True
             self.app.title = "🎙️"
-            log(f"Parakeet model ({model_info['name']}) loaded and warmed up!")
+            log(f"Model ({model_info['name']}) loaded and ready!")
             safe_notification(
                 title="Model Ready",
                 subtitle=f"Loaded {model_info['name']}",
@@ -285,12 +317,12 @@ class VoiceTranscriber:
             )
         except Exception as e:
             self.app.title = "❌"
-            log(f"Error loading Parakeet model: {e}")
+            log(f"Error loading model: {e}")
             import traceback
             log(traceback.format_exc())
             safe_notification(
                 title="Error Loading Model",
-                subtitle="Failed to load Parakeet",
+                subtitle=f"Failed to load {model_info['name']}",
                 message=str(e),
             )
 
@@ -298,7 +330,14 @@ class VoiceTranscriber:
         threading.Thread(target=self.load_vad_model, daemon=True).start()
 
     def _warmup_model(self):
-        """Run a warmup transcription to trigger JIT compilation"""
+        """Run a warmup transcription to trigger JIT compilation (Apple Silicon only).
+
+        Enables local attention mode (reduces compute) and runs a silent audio pass
+        so MLX/Metal compiles the kernels before the first real recording.
+        """
+        if not IS_APPLE_SILICON:
+            return
+
         try:
             self.model.encoder.set_attention_model("rel_pos_local_attn", (256, 256))
             log("Set local attention mode (256, 256)")
@@ -457,17 +496,25 @@ class VoiceTranscriber:
         ).start()
 
     def _transcribe_and_copy(self, audio_path):
-        """Transcribe audio and copy to clipboard"""
+        """Transcribe audio and copy to clipboard.
+
+        Apple Silicon: uses parakeet-mlx (.transcribe returns a result with .text)
+        Intel Mac:     uses faster-whisper (.transcribe yields Segment objects)
+        """
         try:
             log("Starting transcription...")
             start_time = time.time()
 
-            result = self.model.transcribe(
-                str(audio_path),
-                chunk_duration=30.0,
-                overlap_duration=2.0,
-            )
-            transcribed_text = result.text.strip()
+            if IS_APPLE_SILICON:
+                result = self.model.transcribe(
+                    str(audio_path),
+                    chunk_duration=30.0,
+                    overlap_duration=2.0,
+                )
+                transcribed_text = result.text.strip()
+            else:
+                segments, _ = self.model.transcribe(str(audio_path), beam_size=5)
+                transcribed_text = " ".join(seg.text for seg in segments).strip()
 
             elapsed = time.time() - start_time
             log(f"Transcription ({elapsed:.2f}s): '{transcribed_text}'")
