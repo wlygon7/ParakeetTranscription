@@ -3,7 +3,7 @@ name = "parakeet-transcription"
 version = "0.2.0"
 description = "macOS menu bar app for real-time voice transcription — Parakeet/MLX on Apple Silicon, Whisper/CTranslate2 on Intel"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "parakeet-mlx>=0.4.0",
     "faster-whisper>=1.0.0",
