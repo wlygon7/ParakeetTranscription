@@ -144,22 +144,32 @@ class VoiceTranscriber:
             self._resolve_device_by_name()
 
     def _warmup_audio(self):
-        """Pre-initialize PyAudio stream to reduce first-recording latency"""
-        try:
-            log("Warming up audio subsystem...")
-            test_stream = self.audio.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK,
-            )
-            test_stream.read(CHUNK, exception_on_overflow=False)
-            test_stream.stop_stream()
-            test_stream.close()
-            log("Audio warmup complete")
-        except Exception as e:
-            log(f"Audio warmup error (non-fatal): {e}")
+        """Pre-initialize PyAudio stream to reduce first-recording latency.
+
+        Retries a few times with a short delay — the Launch Agent can start
+        before Core Audio is fully initialized, causing transient AUHAL errors.
+        """
+        for attempt in range(4):
+            try:
+                log(f"Warming up audio subsystem (attempt {attempt + 1})...")
+                test_stream = self.audio.open(
+                    format=FORMAT,
+                    channels=CHANNELS,
+                    rate=SAMPLE_RATE,
+                    input=True,
+                    frames_per_buffer=CHUNK,
+                )
+                test_stream.read(CHUNK, exception_on_overflow=False)
+                test_stream.stop_stream()
+                test_stream.close()
+                log("Audio warmup complete")
+                return
+            except Exception as e:
+                if attempt < 3:
+                    log(f"Audio warmup attempt {attempt + 1} failed ({e}), retrying in 2s...")
+                    time.sleep(2)
+                else:
+                    log(f"Audio warmup failed after 4 attempts (non-fatal): {e}")
 
     def _resolve_device_by_name(self):
         """Find device index matching saved device name"""
@@ -784,7 +794,16 @@ class VoiceTranscriptionApp(rumps.App):
             )
 
             if self.event_tap is None:
+                hotkey = "Ctrl+R" if not IS_APPLE_SILICON else "Alt+R"
+                python_path = sys.executable
                 log("Failed to create event tap - accessibility permissions needed!")
+                log(f"Fix: System Settings → Privacy & Security → Accessibility")
+                log(f"     Click '+' and add this Python binary: {python_path}")
+                safe_notification(
+                    title="Accessibility Permission Needed",
+                    subtitle=f"{hotkey} hotkey won't work until granted",
+                    message=f"System Settings → Privacy & Security → Accessibility → add Python",
+                )
                 return
 
             run_loop_source = Quartz.CFMachPortCreateRunLoopSource(
