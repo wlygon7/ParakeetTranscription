@@ -1,8 +1,8 @@
 # Voice Transcription Tool
 
-A hotkey-activated voice transcription tool inspired by Whisper Flow, powered by NVIDIA's Parakeet model optimized for Apple Silicon.
+A hotkey-activated voice transcription tool inspired by Whisper Flow, powered by NVIDIA's Parakeet model optimized for Apple Silicon and Intel.
 
-Press `alt+r` or define another bind to start recording, press again to stop and save to clipboard.
+Press `alt+r` if you are on Silicon, or `control+r` if you are on Intel, or define another bind to start recording, press again to stop and save to clipboard.
 
 Install via `./install_service.sh`
 
