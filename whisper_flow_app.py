@@ -21,12 +21,17 @@ from Quartz import CGEventMaskBit, kCGEventKeyDown
 import Quartz
 import numpy as np
 import tempfile
-import torch
 import time
 
 # Detect CPU architecture: arm64 = Apple Silicon, x86_64 = Intel
 ARCH = platform.machine()
 IS_APPLE_SILICON = (ARCH == "arm64")
+
+# torch is only needed on Apple Silicon (Silero VAD).
+# On Intel, torch + ctranslate2 (faster-whisper) both bundle OpenMP,
+# which causes OMP Error #15 (duplicate runtime) and crashes the process.
+if IS_APPLE_SILICON:
+    import torch
 
 if IS_APPLE_SILICON:
     from parakeet_mlx import from_pretrained
@@ -258,7 +263,15 @@ class VoiceTranscriber:
         return self.get_input_devices()
 
     def load_vad_model(self):
-        """Load Silero VAD model with ONNX for 4-5x faster inference"""
+        """Load Silero VAD model with ONNX for 4-5x faster inference (Apple Silicon only).
+
+        Skipped on Intel: torch and ctranslate2 both bundle OpenMP, loading both
+        triggers OMP Error #15 (duplicate runtime) which aborts the process.
+        """
+        if not IS_APPLE_SILICON:
+            log("Skipping VAD model load on Intel (torch/ctranslate2 OpenMP conflict)")
+            return
+
         try:
             log("Loading Silero VAD model (ONNX mode)...")
             self.vad_model, utils = torch.hub.load(
